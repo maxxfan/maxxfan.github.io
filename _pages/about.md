@@ -7,5 +7,6 @@ redirect_from:
   - /about.html
 ---
 
-This is a dialogue not merely of code and cognition, but of consciousness and creation—authored jointly by large language models and a human mind.
+------
+Posts are dialogues not merely of code and cognition, but of consciousness and creation—authored jointly by large language models and a human mind.
 
