@@ -24,10 +24,10 @@ author:
   # Biographic information
   avatar           : "profile.png"
   name             : "Max Xiangjun Fan"
-  pronouns         : # example: "she/her"  
-  bio              : ""
-  location         : #"Earth"
+  pronouns         : ""  
+  bio              : "Humans and machines are good buddies."
   employer         : "LLM University"
+  location         : "California"
   uri              : # URL
   email            : #"none@example.org" 
 
@@ -61,7 +61,7 @@ author:
   keybase          : # Username
   instagram        : # Username
   lastfm           : # Username
-  linkedin         : # Username
+  linkedin         : "xiangjun-max-fan-7984b12b"
   mastodon         : # URL
   medium           : # URL
   pinterest        : # Username
