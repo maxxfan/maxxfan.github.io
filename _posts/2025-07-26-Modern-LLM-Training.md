@@ -93,30 +93,136 @@ Here $d$ is the dimensionality of the query/key vectors (we divide by $\sqrt{d}$
 
 Transformers use **multi-head attention**, meaning the mechanism is replicated $h$ times with different learned linear projections for $Q, K, V$ (so each head can attend to different aspects). The outputs of all heads are concatenated and linearly transformed to form the final attention output. Multi-head attention allows the model to simultaneously consider various types of relationships (e.g. syntax, coreference, semantic similarity) at different positions.
 
+Let the per-token hidden size be $d_\text{model}$ and the number of heads be $h$ with per-head width $d_h=\frac{d_\text{model}}{h}$. For a (batchless) sequence $X\in\mathbb{R}^{T\times d_\text{model}}$,
+
+$$
+Q_i = X W_i^Q, K_i = X W_i^K, V_i = X W_i^V,\quad
+W_i^Q, W_i^K, W_i^V \in \mathbb{R}^{d_\text{model}\times d_h},\quad i=1,\dots,h.
+$$
+
+For **causal** decoding, define a mask $M\in\mathbb{R}^{T\times T}$ whose entries are
+
+$$
+M_{tj} = \begin{cases}
+0, & j\le t\\
+-\infty, & j>t~,
+\end{cases}
+$$
+
+so positions cannot attend to the future. Each head computes scaled dot-product attention
+
+$$
+H_i \;=\; \operatorname{softmax}\!\left(\frac{Q_i K_i^\top}{\sqrt{d_h}} + M \right)V_i \;\in\; \mathbb{R}^{T\times d_h}.
+$$
+
+Concatenate heads and project:
+
+$$
+\operatorname{MHA}(X) \;=\; \big[\,H_1 ~\|~ H_2 ~\|~ \cdots ~\|~ H_h\,\big]\, W^O,\qquad
+W^O\in\mathbb{R}^{(h\,d_h)\times d_\text{model}}.
+$$
+
+With batch size $B$, the same equations apply elementwise to $X\in\mathbb{R}^{B\times T\times d_\text{model}}$; the mask broadcasts to $(B,h,T,T)$ in implementations.
+
 **Feed-Forward Network and Layer Structure**: In addition to the attention sublayer, each Transformer block has a position-wise feed-forward network (FFN). This is typically a two-layer MLP applied independently to each token’s representation, increasing the model’s capacity to transform and non-linearly mix features. A common design is an FFN with an intermediate dimension of 4× the model’s hidden size and a GeLU or SwiGLU activation. The output of the FFN is added (with a residual skip connection) to the attention output. Layer normalization is applied at appropriate points (often just before attention and FFN, or as a combined pre-norm or post-norm style).
 
 To summarize a single Transformer layer in pseudocode:
 ```python
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class MultiHeadSelfAttention(nn.Module):
+    """
+    Implements MHA as in the equations:
+      Q_i = X W_i^Q, K_i = X W_i^K, V_i = X W_i^V
+      head_i = softmax((Q_i K_i^T)/sqrt(d_h) + M) V_i
+      MHA(X) = Concat(head_i) W^O
+    """
+    def __init__(self, d_model: int, num_heads: int, bias: bool = False, causal: bool = True):
+        super().__init__()
+        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
+        self.d_model = d_model
+        self.h = num_heads
+        self.d_h = d_model // num_heads
+        self.causal = causal
+
+        # Single projection for Q,K,V for efficiency; split the last dim into 3 chunks
+        self.qkv = nn.Linear(d_model, 3 * d_model, bias=bias)
+        self.out = nn.Linear(d_model, d_model, bias=bias)
+
+    def _causal_mask(self, T: int, device):
+        # shape: (1, 1, T, T) broadcastable to (B, h, T, T)
+        mask = torch.full((T, T), float("-inf"), device=device)
+        mask = torch.triu(mask, diagonal=1)  # -inf above diagonal, 0 on/below
+        return mask.unsqueeze(0).unsqueeze(0)
+
+    def forward(self, x: torch.Tensor, attn_mask: torch.Tensor | None = None):
+        """
+        x: (B, T, d_model)
+        attn_mask: optional additive mask broadcastable to (B, h, T, T)
+                   (use 0 for keep, -inf for block)
+        """
+        B, T, _ = x.shape
+
+        # Project to Q,K,V and reshape to heads
+        qkv = self.qkv(x)                               # (B, T, 3*d_model)
+        q, k, v = qkv.chunk(3, dim=-1)
+        # (B, T, d_model) -> (B, h, T, d_h)
+        def split_heads(t):
+            return t.view(B, T, self.h, self.d_h).transpose(1, 2)
+        q = split_heads(q)
+        k = split_heads(k)
+        v = split_heads(v)
+
+        # Scaled dot-product attention
+        scores = q @ k.transpose(-2, -1)                # (B, h, T, T)
+        scores = scores / math.sqrt(self.d_h)
+
+        if self.causal:
+            scores = scores + self._causal_mask(T, x.device)
+        if attn_mask is not None:
+            scores = scores + attn_mask  # additive mask: 0 or -inf
+
+        weights = F.softmax(scores, dim=-1)             # (B, h, T, T)
+        context = weights @ v                            # (B, h, T, d_h)
+
+        # Merge heads
+        context = context.transpose(1, 2).contiguous().view(B, T, self.d_model)  # (B, T, d_model)
+        y = self.out(context)                            # (B, T, d_model)
+        return y, weights
+
 class TransformerBlock(nn.Module):
-    def __init__(self, hidden_dim, num_heads, ffn_dim):
-        self.self_attn = nn.MultiheadAttention(hidden_dim, num_heads)
-        self.layernorm1 = nn.LayerNorm(hidden_dim)
+    def __init__(self, hidden_dim: int, num_heads: int, ffn_dim: int, causal: bool = True, dropout: float = 0.0):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(hidden_dim)
+        self.attn = MultiHeadSelfAttention(hidden_dim, num_heads, causal=causal)
+        self.ln2 = nn.LayerNorm(hidden_dim)
         self.ffn = nn.Sequential(
             nn.Linear(hidden_dim, ffn_dim),
             nn.GELU(),
-            nn.Linear(ffn_dim, hidden_dim)
+            nn.Linear(ffn_dim, hidden_dim),
         )
-        self.layernorm2 = nn.LayerNorm(hidden_dim)
+        self.drop = nn.Dropout(dropout)
+
     def forward(self, x, attn_mask=None):
-        # Self-attention sublayer
-        x_norm = self.layernorm1(x)
-        attn_output, _ = self.self_attn(x_norm, x_norm, x_norm, attn_mask=attn_mask)
-        x = x + attn_output        # add residual connection
-        # Feed-forward sublayer
-        x_norm = self.layernorm2(x)
-        ffn_output = self.ffn(x_norm)
-        x = x + ffn_output         # add residual connection
+        # Pre-norm attention
+        a, _ = self.attn(self.ln1(x), attn_mask=attn_mask)
+        x = x + self.drop(a)
+        # Pre-norm feed-forward
+        f = self.ffn(self.ln2(x))
+        x = x + self.drop(f)
         return x
+
+# --- Demo usage ---
+if __name__ == "__main__":
+    torch.manual_seed(0)
+    B, T, d_model, h = 2, 8, 512, 8
+    x = torch.randn(B, T, d_model)
+    block = TransformerBlock(hidden_dim=d_model, num_heads=h, ffn_dim=4*d_model, causal=True)
+    y = block(x)  # (B, T, d_model)
+    print("Input shape:", x.shape, "Output shape:", y.shape)
 ```
 
 This simplistic code highlights the components: multi-head attention and feed-forward network with skip connections. In practice, modern architectures introduce variations (different normalization placements, gating mechanisms, etc.), but the essence remains: alternating attention and pointwise FFN layers.
